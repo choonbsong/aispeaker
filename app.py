@@ -1,5 +1,6 @@
 import ast
 import math
+import os
 import operator
 import re
 from datetime import datetime
@@ -7,12 +8,12 @@ from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 
 st.set_page_config(page_title="한결 · AI 비서", page_icon="💬", layout="centered")
 
 DEFAULT_MODEL = "openai/gpt-oss-120b"
-GROQ_API_KEY = "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"  # Paste your key here for local use only; never commit or deploy it.
 MAX_PROMPT_CHARS = 4000
 MAX_HISTORY_MESSAGES = 20
 SPEECH_KEY = "browser_speech_bridge"
@@ -21,7 +22,7 @@ MOBILE_STYLES = """
 <style>
 @media (max-width: 640px) {
   .stApp [data-testid="stMainBlockContainer"] {
-    padding: 1rem 0.75rem 6rem;
+    padding: 4.5rem 0.75rem 6rem;
   }
   .stApp h1 {
     font-size: 1.65rem;
@@ -54,9 +55,6 @@ MOBILE_STYLES = """
     min-height: 48px;
     font-size: 1rem;
   }
-  .stApp [data-testid="stSidebar"] {
-    min-width: min(86vw, 22rem);
-  }
 }
 </style>
 """
@@ -76,7 +74,7 @@ SPEECH_HTML = """
   <div class="speech-controls">
     <button id="speech-start" type="button">🎙️ 음성 입력 시작</button>
     <button id="speech-stop" type="button">⏹️ 녹음 종료</button>
-    <button id="speech-cancel" type="button">🔇 음성 재생 중지</button>
+    <button id="speech-cancel" type="button">⏹️ 답변 재생 중지</button>
     <span id="speech-status" role="status">브라우저 음성 기능을 확인하는 중입니다.</span>
   </div>
   <div id="speech-answers" aria-label="답변 음성 재생"></div>
@@ -99,6 +97,10 @@ export default function (component) {
     lastVoices: "",
     finalTranscript: "",
     lastError: "",
+    silenceTimer: null,
+    isListening: false,
+    isSpeechActive: false,
+    lastAutoSpeakRequestId: null,
   }
   parentElement.__hanGyeolSpeech = state
 
@@ -120,13 +122,40 @@ export default function (component) {
         recognition.onstart = () => {
           state.finalTranscript = ""
           state.lastError = ""
-          statusElement.textContent = "듣고 있습니다. 녹음을 끝내려면 종료 버튼을 누르세요."
+          state.isListening = true
+          state.isSpeechActive = false
+          if (state.silenceTimer !== null) {
+            window.clearTimeout(state.silenceTimer)
+            state.silenceTimer = null
+          }
+          statusElement.textContent = "듣고 있습니다. 말이 끝나면 1.4초 후 자동 전송합니다."
           setStateValue("status", "listening")
+        }
+        const scheduleSilenceStop = () => {
+          if (state.silenceTimer !== null) window.clearTimeout(state.silenceTimer)
+          state.silenceTimer = window.setTimeout(() => {
+            state.silenceTimer = null
+            if (state.isListening) recognition.stop()
+          }, 1400)
+        }
+        recognition.onspeechstart = () => {
+          state.isSpeechActive = true
+          if (state.silenceTimer !== null) {
+            window.clearTimeout(state.silenceTimer)
+            state.silenceTimer = null
+          }
+        }
+        recognition.onspeechend = () => {
+          state.isSpeechActive = false
+          if (state.finalTranscript.trim()) scheduleSilenceStop()
         }
         recognition.onresult = (event) => {
           for (let i = event.resultIndex; i < event.results.length; i += 1) {
-            if (event.results[i].isFinal) {
-              state.finalTranscript += event.results[i][0].transcript + " "
+            const result = event.results[i]
+            const transcript = result[0].transcript.trim()
+            if (transcript) {
+              if (result.isFinal) state.finalTranscript += transcript + " "
+              if (!state.isSpeechActive) scheduleSilenceStop()
             }
           }
         }
@@ -139,10 +168,22 @@ export default function (component) {
           }
           const message = messages[event.error] || "음성 인식 중 문제가 발생했습니다. 텍스트 입력을 이용하거나 다시 시도해 주세요."
           state.lastError = message
+          state.isListening = false
+          state.isSpeechActive = false
+          if (state.silenceTimer !== null) {
+            window.clearTimeout(state.silenceTimer)
+            state.silenceTimer = null
+          }
           statusElement.textContent = message
           setStateValue("status", message)
         }
         recognition.onend = () => {
+          state.isListening = false
+          state.isSpeechActive = false
+          if (state.silenceTimer !== null) {
+            window.clearTimeout(state.silenceTimer)
+            state.silenceTimer = null
+          }
           const text = state.finalTranscript.trim()
           if (text) {
             state.transcriptId += 1
@@ -176,7 +217,7 @@ export default function (component) {
   cancelButton.onclick = () => {
     if (window.speechSynthesis) {
       window.speechSynthesis.cancel()
-      statusElement.textContent = "음성 재생을 중지했습니다."
+      statusElement.textContent = "답변 재생을 중지했습니다."
     }
   }
 
@@ -201,31 +242,50 @@ export default function (component) {
 
   const settings = data || {}
   answersElement.replaceChildren()
+  const speakAnswer = (answer) => {
+    if (!window.speechSynthesis) {
+      statusElement.textContent = "이 브라우저는 음성 합성을 지원하지 않습니다."
+      return
+    }
+    window.speechSynthesis.cancel()
+    const utterance = new SpeechSynthesisUtterance(answer)
+    utterance.lang = "ko-KR"
+    utterance.rate = Number(settings.rate || 1)
+    utterance.volume = Number(settings.volume ?? 1)
+    const voices = window.speechSynthesis.getVoices()
+    const selected = voices.find((voice) => voice.voiceURI === settings.voice)
+    if (selected) utterance.voice = selected
+    utterance.onstart = () => { statusElement.textContent = "답변을 읽고 있습니다." }
+    utterance.onend = () => { statusElement.textContent = "답변 음성 재생이 끝났습니다." }
+    utterance.onerror = (event) => {
+      statusElement.textContent = event.error === "not-allowed"
+        ? "브라우저가 자동 음성 재생을 차단했습니다. 답변의 음성 재생 버튼을 눌러 주세요."
+        : "음성 재생에 실패했습니다. 텍스트 답변을 확인해 주세요."
+    }
+    window.speechSynthesis.speak(utterance)
+  }
+
   ;(settings.answers || []).forEach((answer, index) => {
     const button = document.createElement("button")
     button.type = "button"
     button.textContent = "🔊 답변 " + (index + 1) + " 음성 재생"
     button.setAttribute("aria-label", "답변 " + (index + 1) + " 전체 음성 재생")
-    button.onclick = () => {
-      if (!window.speechSynthesis) {
-        statusElement.textContent = "이 브라우저는 음성 합성을 지원하지 않습니다."
-        return
-      }
-      window.speechSynthesis.cancel()
-      const utterance = new SpeechSynthesisUtterance(answer)
-      utterance.lang = "ko-KR"
-      utterance.rate = Number(settings.rate || 1)
-      utterance.volume = Number(settings.volume ?? 1)
-      const voices = window.speechSynthesis.getVoices()
-      const selected = voices.find((voice) => voice.voiceURI === settings.voice)
-      if (selected) utterance.voice = selected
-      utterance.onstart = () => { statusElement.textContent = "답변을 읽고 있습니다." }
-      utterance.onend = () => { statusElement.textContent = "음성 재생이 끝났습니다." }
-      utterance.onerror = () => { statusElement.textContent = "음성 재생에 실패했습니다. 텍스트 답변을 확인해 주세요." }
-      window.speechSynthesis.speak(utterance)
-    }
+    button.onclick = () => speakAnswer(answer)
     answersElement.appendChild(button)
   })
+
+  const answers = settings.answers || []
+  const latestAnswer = answers.length ? answers[answers.length - 1] : null
+  const autoSpeakRequestId = settings.autoSpeakRequestId
+  if (
+    latestAnswer
+    && autoSpeakRequestId !== null
+    && autoSpeakRequestId !== undefined
+    && state.lastAutoSpeakRequestId !== autoSpeakRequestId
+  ) {
+    state.lastAutoSpeakRequestId = autoSpeakRequestId
+    speakAnswer(latestAnswer)
+  }
 
   return () => {
     if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = null
@@ -242,6 +302,19 @@ SPEECH_COMPONENT = st.components.v2.component(
 
 class UserFacingError(Exception):
     pass
+
+
+def get_groq_api_key():
+    environment_key = os.environ.get("GROQ_API_KEY", "")
+    if environment_key:
+        return environment_key
+    try:
+        secret_key = st.secrets["GROQ_API_KEY"]
+    except (KeyError, StreamlitSecretNotFoundError):
+        return ""
+    if not isinstance(secret_key, str):
+        raise UserFacingError("GROQ_API_KEY 설정은 문자열이어야 합니다.")
+    return secret_key
 
 
 def _number(value):
@@ -540,7 +613,7 @@ def route_tool(prompt, place):
 
 def _groq_reply(prompt, api_key, model, max_tokens):
     if not api_key:
-        raise UserFacingError("app.py 상단의 GROQ_API_KEY에 Groq API 키를 입력한 뒤 앱을 다시 실행해 주세요.")
+        raise UserFacingError("GROQ_API_KEY 환경변수 또는 Streamlit Secrets에 키를 설정해 주세요.")
     from groq import (
         APIConnectionError,
         APIStatusError,
@@ -604,7 +677,7 @@ def process_prompt(prompt):
         if answer is None:
             answer = _groq_reply(
                 prompt,
-                GROQ_API_KEY,
+                get_groq_api_key(),
                 st.session_state.model,
                 st.session_state.max_tokens,
             )
@@ -631,6 +704,7 @@ for state_key, default in (
     ("max_tokens", 2048),
     ("consumed_transcript_id", None),
     ("pending_version", 0),
+    ("auto_speak_request_id", None),
 ):
     if state_key not in st.session_state:
         st.session_state[state_key] = default
@@ -642,11 +716,12 @@ def clear_conversation():
     st.session_state.pending_error = None
     st.session_state.pending_version += 1
     st.session_state.consumed_transcript_id = None
+    st.session_state.auto_speak_request_id = None
 
 
 with st.sidebar:
     st.header("설정")
-    st.caption("코드의 GROQ_API_KEY: " + ("설정됨" if GROQ_API_KEY else "미설정"))
+    st.caption("Groq API 키: " + ("설정됨" if get_groq_api_key() else "미설정"))
     st.text_input("모델", key="model", help="기본 모델: openai/gpt-oss-120b")
     st.slider("최대 답변 길이(토큰)", min_value=256, max_value=4096, step=256, key="max_tokens")
     st.text_input("날씨 지역", key="weather_place", max_chars=100, help="예: 서울, 부산, 춘천")
@@ -730,6 +805,7 @@ if st.session_state.pending_prompt is None:
 else:
     st.chat_input("먼저 전송되지 않은 질문을 수정하거나 다시 보내세요", disabled=True)
 
+auto_speak_request_id = st.session_state.auto_speak_request_id
 speech_state = SPEECH_COMPONENT(
     key=SPEECH_KEY,
     data={
@@ -741,11 +817,13 @@ speech_state = SPEECH_COMPONENT(
         "voice": selected_voice,
         "rate": tts_rate,
         "volume": tts_volume,
+        "autoSpeakRequestId": auto_speak_request_id,
     },
     on_submitted_transcript_change=lambda: None,
     on_status_change=lambda: None,
     on_voices_change=lambda: None,
 )
+st.session_state.auto_speak_request_id = None
 
 transcript_submission = (
     speech_state.submitted_transcript
@@ -765,7 +843,9 @@ if isinstance(transcript_submission, dict):
         st.session_state.pending_error = None
         st.session_state.pending_version += 1
         with st.spinner("음성 질문에 답변하고 있습니다..."):
-            process_prompt(st.session_state.pending_prompt)
+            completed = process_prompt(st.session_state.pending_prompt)
+        if completed:
+            st.session_state.auto_speak_request_id = transcript_id
         st.rerun()
 
 browser_status = speech_state.status if hasattr(speech_state, "status") else None
