@@ -17,8 +17,62 @@ MAX_PROMPT_CHARS = 4000
 MAX_HISTORY_MESSAGES = 20
 SPEECH_KEY = "browser_speech_bridge"
 
+MOBILE_STYLES = """
+<style>
+@media (max-width: 640px) {
+  .stApp [data-testid="stMainBlockContainer"] {
+    padding: 1rem 0.75rem 6rem;
+  }
+  .stApp h1 {
+    font-size: 1.65rem;
+    line-height: 1.25;
+  }
+  .stApp [data-testid="stChatMessage"] {
+    padding: 0.85rem 0.7rem;
+  }
+  .stApp [data-testid="stChatMessage"] p,
+  .stApp [data-testid="stChatMessage"] li {
+    font-size: 1.05rem;
+    line-height: 1.65;
+    overflow-wrap: anywhere;
+  }
+  .stApp [data-testid="stChatInput"] textarea,
+  .stApp [data-testid="stTextArea"] textarea,
+  .stApp [data-testid="stTextInput"] input {
+    font-size: 16px;
+    line-height: 1.5;
+  }
+  .stApp [data-testid="stChatInput"] textarea {
+    min-height: 48px;
+  }
+  .stApp [data-testid="stChatInput"] button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .stApp .stButton button,
+  .stApp [data-testid="stFormSubmitButton"] button {
+    min-height: 48px;
+    font-size: 1rem;
+  }
+  .stApp [data-testid="stSidebar"] {
+    min-width: min(86vw, 22rem);
+  }
+}
+</style>
+"""
+
 SPEECH_HTML = """
 <section aria-label="브라우저 음성 도구">
+  <style>
+    .speech-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; align-items: center; }
+    .speech-controls button, #speech-answers button { min-height: 48px; padding: 0.7rem; font-size: 16px; }
+    #speech-status { grid-column: 1 / -1; line-height: 1.5; overflow-wrap: anywhere; }
+    #speech-answers { display: grid; gap: 0.5rem; margin-top: 0.75rem; }
+    @media (max-width: 640px) {
+      .speech-controls { grid-template-columns: 1fr; }
+      .speech-controls button, #speech-answers button { width: 100%; }
+    }
+  </style>
   <div class="speech-controls">
     <button id="speech-start" type="button">🎙️ 음성 입력 시작</button>
     <button id="speech-stop" type="button">⏹️ 녹음 종료</button>
@@ -31,7 +85,7 @@ SPEECH_HTML = """
 
 SPEECH_JS = """
 export default function (component) {
-  const { data, parentElement, setStateValue } = component
+  const { data, parentElement, setStateValue, setTriggerValue } = component
   const startButton = parentElement.querySelector("#speech-start")
   const stopButton = parentElement.querySelector("#speech-stop")
   const cancelButton = parentElement.querySelector("#speech-cancel")
@@ -44,6 +98,7 @@ export default function (component) {
     transcriptId: 0,
     lastVoices: "",
     finalTranscript: "",
+    lastError: "",
   }
   parentElement.__hanGyeolSpeech = state
 
@@ -64,6 +119,7 @@ export default function (component) {
         recognition.interimResults = true
         recognition.onstart = () => {
           state.finalTranscript = ""
+          state.lastError = ""
           statusElement.textContent = "듣고 있습니다. 녹음을 끝내려면 종료 버튼을 누르세요."
           setStateValue("status", "listening")
         }
@@ -73,10 +129,6 @@ export default function (component) {
               state.finalTranscript += event.results[i][0].transcript + " "
             }
           }
-          const text = state.finalTranscript.trim()
-          if (!text) return
-          state.transcriptId += 1
-          setStateValue("transcript", { text, id: state.transcriptId })
         }
         recognition.onerror = (event) => {
           const messages = {
@@ -86,12 +138,22 @@ export default function (component) {
             "audio-capture": "마이크를 찾을 수 없습니다. 연결 상태와 권한을 확인해 주세요."
           }
           const message = messages[event.error] || "음성 인식 중 문제가 발생했습니다. 텍스트 입력을 이용하거나 다시 시도해 주세요."
+          state.lastError = message
           statusElement.textContent = message
           setStateValue("status", message)
         }
         recognition.onend = () => {
-          statusElement.textContent = "음성 입력이 끝났습니다. 인식 결과를 확인하고 수정한 뒤 전송하세요."
-          setStateValue("status", "complete")
+          const text = state.finalTranscript.trim()
+          if (text) {
+            state.transcriptId += 1
+            state.finalTranscript = ""
+            statusElement.textContent = "인식된 질문을 전송하고 답변을 준비하고 있습니다."
+            setStateValue("status", "submitting")
+            setTriggerValue("submitted_transcript", { text, id: state.transcriptId })
+          } else if (!state.lastError) {
+            statusElement.textContent = "음성이 인식되지 않았습니다. 다시 말하거나 텍스트를 입력해 주세요."
+            setStateValue("status", "no-speech")
+          }
         }
         state.recognition = recognition
       }
@@ -567,8 +629,6 @@ for state_key, default in (
     ("weather_place", "서울"),
     ("model", DEFAULT_MODEL),
     ("max_tokens", 2048),
-    ("voice_draft", ""),
-    ("voice_draft_revision", 0),
     ("consumed_transcript_id", None),
     ("pending_version", 0),
 ):
@@ -576,28 +636,12 @@ for state_key, default in (
         st.session_state[state_key] = default
 
 
-speech_state = st.session_state.get(SPEECH_KEY, {})
-if not isinstance(speech_state, dict):
-    speech_state = {}
-transcript_event = speech_state.get("transcript")
-if isinstance(transcript_event, dict) and transcript_event.get("id") != st.session_state.consumed_transcript_id:
-    st.session_state.consumed_transcript_id = transcript_event.get("id")
-    st.session_state.voice_draft = str(transcript_event.get("text", ""))[:MAX_PROMPT_CHARS]
-    st.session_state.voice_draft_revision += 1
-
-
 def clear_conversation():
     st.session_state.messages = []
     st.session_state.pending_prompt = None
     st.session_state.pending_error = None
-    st.session_state.voice_draft = ""
-    st.session_state.voice_draft_revision += 1
     st.session_state.pending_version += 1
-    current_speech_state = st.session_state.get(SPEECH_KEY, {})
-    if isinstance(current_speech_state, dict):
-        current_event = current_speech_state.get("transcript")
-        if isinstance(current_event, dict):
-            st.session_state.consumed_transcript_id = current_event.get("id")
+    st.session_state.consumed_transcript_id = None
 
 
 with st.sidebar:
@@ -607,6 +651,9 @@ with st.sidebar:
     st.slider("최대 답변 길이(토큰)", min_value=256, max_value=4096, step=256, key="max_tokens")
     st.text_input("날씨 지역", key="weather_place", max_chars=100, help="예: 서울, 부산, 춘천")
 
+    speech_state = st.session_state.get(SPEECH_KEY, {})
+    if not isinstance(speech_state, dict):
+        speech_state = {}
     voices = speech_state.get("voices", [])
     usable_voices = [
         item for item in voices
@@ -640,6 +687,7 @@ with st.sidebar:
 
 st.title("한결 · AI 비서")
 st.caption("한국어로 편하게 질문해 주세요. 시간·날씨·계산은 도구로 확인합니다.")
+st.markdown(MOBILE_STYLES, unsafe_allow_html=True)
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -664,34 +712,6 @@ if st.session_state.pending_prompt is not None:
         st.session_state.pending_version += 1
         with st.spinner("답변을 준비하고 있습니다..."):
             process_prompt(st.session_state.pending_prompt)
-        st.rerun()
-
-if st.session_state.voice_draft:
-    st.subheader("음성 입력 확인")
-    st.caption("인식된 내용을 직접 수정한 뒤에만 전송됩니다.")
-    voice_key = f"voice_editor_{st.session_state.voice_draft_revision}"
-    with st.form("voice_transcript_form", clear_on_submit=False):
-        st.text_area(
-            "인식 결과",
-            value=st.session_state.voice_draft,
-            key=voice_key,
-            max_chars=MAX_PROMPT_CHARS,
-            height=110,
-        )
-        send_voice = st.form_submit_button(
-            "확인한 음성 질문 전송",
-            type="primary",
-            disabled=speech_state.get("status") == "listening",
-        )
-    if send_voice:
-        voice_prompt = st.session_state[voice_key]
-        st.session_state.voice_draft = ""
-        st.session_state.voice_draft_revision += 1
-        st.session_state.pending_version += 1
-        st.session_state.pending_prompt = voice_prompt
-        st.session_state.pending_error = None
-        with st.spinner("답변을 준비하고 있습니다..."):
-            process_prompt(voice_prompt)
         st.rerun()
 
 if st.session_state.pending_prompt is None:
@@ -722,11 +742,32 @@ speech_state = SPEECH_COMPONENT(
         "rate": tts_rate,
         "volume": tts_volume,
     },
-    on_transcript_change=lambda: None,
+    on_submitted_transcript_change=lambda: None,
     on_status_change=lambda: None,
     on_voices_change=lambda: None,
 )
 
+transcript_submission = (
+    speech_state.submitted_transcript
+    if hasattr(speech_state, "submitted_transcript")
+    else None
+)
+if isinstance(transcript_submission, dict):
+    transcript_id = transcript_submission.get("id")
+    transcript_text = transcript_submission.get("text")
+    if (
+        transcript_id != st.session_state.consumed_transcript_id
+        and isinstance(transcript_text, str)
+        and transcript_text.strip()
+    ):
+        st.session_state.consumed_transcript_id = transcript_id
+        st.session_state.pending_prompt = transcript_text
+        st.session_state.pending_error = None
+        st.session_state.pending_version += 1
+        with st.spinner("음성 질문에 답변하고 있습니다..."):
+            process_prompt(st.session_state.pending_prompt)
+        st.rerun()
+
 browser_status = speech_state.status if hasattr(speech_state, "status") else None
-if browser_status and browser_status not in ("listening", "complete"):
+if browser_status and browser_status not in ("listening", "complete", "submitting"):
     st.caption(str(browser_status))
