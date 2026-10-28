@@ -305,7 +305,11 @@ class UserFacingError(Exception):
 
 
 def get_groq_api_key():
-    environment_key = os.environ.get("GROQ_API_KEY", "")
+    session_key = st.session_state.get("groq_api_key_input", "")
+    if isinstance(session_key, str) and session_key.strip():
+        return session_key.strip()
+
+    environment_key = os.environ.get("GROQ_API_KEY", "").strip()
     if environment_key:
         return environment_key
     try:
@@ -314,7 +318,7 @@ def get_groq_api_key():
         return ""
     if not isinstance(secret_key, str):
         raise UserFacingError("GROQ_API_KEY 설정은 문자열이어야 합니다.")
-    return secret_key
+    return secret_key.strip()
 
 
 def _number(value):
@@ -613,7 +617,9 @@ def route_tool(prompt, place):
 
 def _groq_reply(prompt, api_key, model, max_tokens):
     if not api_key:
-        raise UserFacingError("GROQ_API_KEY 환경변수 또는 Streamlit Secrets에 키를 설정해 주세요.")
+        raise UserFacingError(
+            "사이드바에 Groq API 키를 입력하거나 GROQ_API_KEY 환경변수/Streamlit Secrets를 설정해 주세요."
+        )
     from groq import (
         APIConnectionError,
         APIStatusError,
@@ -721,7 +727,20 @@ def clear_conversation():
 
 with st.sidebar:
     st.header("설정")
-    st.caption("Groq API 키: " + ("설정됨" if get_groq_api_key() else "미설정"))
+    st.text_input(
+        "Groq API 키",
+        type="password",
+        key="groq_api_key_input",
+        placeholder="Groq API 키를 입력하세요",
+        help="입력한 키는 현재 세션에만 유지되며 서버 환경변수나 Streamlit Secrets보다 우선 사용됩니다.",
+    )
+    session_key = st.session_state.get("groq_api_key_input", "")
+    if isinstance(session_key, str) and session_key.strip():
+        st.caption("현재 세션에 입력한 키를 사용합니다.")
+    elif get_groq_api_key():
+        st.caption("서버 환경변수 또는 Streamlit Secrets에 설정된 키를 사용합니다.")
+    else:
+        st.caption("Groq API 키가 없습니다. 키를 입력하거나 서버 설정을 확인해 주세요.")
     st.text_input("모델", key="model", help="기본 모델: openai/gpt-oss-120b")
     st.slider("최대 답변 길이(토큰)", min_value=256, max_value=4096, step=256, key="max_tokens")
     st.text_input("날씨 지역", key="weather_place", max_chars=100, help="예: 서울, 부산, 춘천")
